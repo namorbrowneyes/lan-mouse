@@ -8,6 +8,7 @@ members = [
     "lan-mouse-gtk",
     "lan-mouse-proto",
 ]
+exclude = ["vendor/webrtc-util"]
 
 [package]
 name = "lan-mouse"
@@ -101,3 +102,6 @@ resources = ["target/menubar-template.png"]
 [package.metadata.bundle.osx]
 info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 
+# lan-mouse fork: webrtc-util with the Windows 10054 listener fix, see vendor/webrtc-util/src/conn/conn_udp_listener.rs
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }

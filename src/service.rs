@@ -184,8 +184,14 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // lan-mouse fork: keep the outgoing links up. Without this a link that
+        // was closed (peer restarted, network blip) is only reopened by the
+        // next crossing, which then fails with "not connected".
+        let mut keep_connected = tokio::time::interval(Duration::from_secs(15));
+
         loop {
             tokio::select! {
+                _ = keep_connected.tick() => self.keep_connected(),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -317,6 +323,14 @@ impl Service {
         }
     }
 
+    /// (re)open the connection to every active client that has none;
+    /// a no-op for clients that are connected or already connecting
+    fn keep_connected(&self) {
+        for handle in self.client_manager.active_clients() {
+            self.connection.connect(handle);
+        }
+    }
+
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
@@ -362,6 +376,9 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                // a peer that just connected to us is up: open our side now
+                // instead of waiting for the next tick
+                self.keep_connected();
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {

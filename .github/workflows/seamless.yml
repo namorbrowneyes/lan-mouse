@@ -1,0 +1,50 @@
+name: "Seamless fork build"
+
+# Builds the two binaries Roman runs: a daemon-only lan-mouse.exe for Titan
+# (no GTK, so no hour-long gvsbuild) and the macOS arm64 app bundle.
+on:
+  push:
+    branches: [ "seamless" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Release build (daemon + cli, no GTK)
+      run: cargo build --release --no-default-features
+    - uses: actions/upload-artifact@v6
+      with:
+        name: lan-mouse-windows-daemon
+        path: target/release/lan-mouse.exe
+
+  macos-arm64:
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v6
+    - name: install dependencies
+      run: |
+        brew install --cask inkscape
+        brew install gtk4 libadwaita imagemagick librsvg
+    - name: Release Build
+      run: cargo build --release
+    - name: Make icns
+      run: scripts/makeicns.sh
+    - name: Install cargo bundle
+      run: cargo install cargo-bundle
+    - name: Bundle
+      run: |
+        cargo bundle --release
+        scripts/copy-macos-dylib.sh "target/release/bundle/osx/Lan Mouse.app/Contents/MacOS/lan-mouse"
+    - name: Zip bundle
+      run: |
+        cd target/release/bundle/osx
+        zip -r "lan-mouse-macos-arm64.zip" "Lan Mouse.app"
+    - uses: actions/upload-artifact@v6
+      with:
+        name: lan-mouse-macos-arm64
+        path: target/release/bundle/osx/lan-mouse-macos-arm64.zip
