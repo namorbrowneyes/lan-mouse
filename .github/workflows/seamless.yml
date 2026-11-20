@@ -32,6 +32,8 @@ jobs:
         brew install gtk4 libadwaita imagemagick librsvg
     - name: Release Build
       run: cargo build --release
+    - name: Fork tests (macOS capture)
+      run: cargo test --release -p input-capture synthetic_mods
     - name: Make icns
       run: scripts/makeicns.sh
     - name: Install cargo bundle

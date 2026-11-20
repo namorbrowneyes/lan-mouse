@@ -207,6 +207,32 @@ impl InputCaptureState {
     }
 }
 
+// fork: evdev left modifier keys for flags set on a key event but not physically held
+fn synthetic_mods(flags: CGEventFlags, held: XMods) -> Vec<u32> {
+    [
+        (CGEventFlags::CGEventFlagControl, XMods::ControlMask, 29u32), // KEY_LEFTCTRL
+        (CGEventFlags::CGEventFlagShift, XMods::ShiftMask, 42),        // KEY_LEFTSHIFT
+        (CGEventFlags::CGEventFlagAlternate, XMods::Mod1Mask, 56),     // KEY_LEFTALT
+        (CGEventFlags::CGEventFlagCommand, XMods::Mod4Mask, 125),      // KEY_LEFTMETA
+    ]
+    .into_iter()
+    .filter(|&(f, m, _)| flags.contains(f) && !held.contains(m))
+    .map(|(_, _, k)| k)
+    .collect()
+}
+
+#[cfg(test)]
+mod synthetic_mods_tests {
+    use super::*;
+    #[test]
+    fn adds_only_unheld() {
+        let f = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift;
+        assert_eq!(synthetic_mods(f, XMods::empty()), vec![42, 125]);
+        assert_eq!(synthetic_mods(f, XMods::Mod4Mask), vec![42]);
+        assert!(synthetic_mods(CGEventFlags::empty(), XMods::empty()).is_empty());
+    }
+}
+
 fn get_events(
     ev_type: &CGEventType,
     ev: &CGEvent,
@@ -232,11 +258,14 @@ fn get_events(
     match ev_type {
         CGEventType::KeyDown => {
             let k = map_key(ev)?;
-            result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                time: 0,
-                key: k,
-                state: 1,
-            })));
+            // fork: apps like Logi Options+ post keystrokes with Cmd/Ctrl/Alt/Shift set only in
+            // the event flags, with no FlagsChanged event, so the other side got a bare key.
+            // Press the missing modifiers around the key.
+            let extra = synthetic_mods(ev.get_flags(), *modifier_state);
+            let key = |key, state| CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { time: 0, key, state }));
+            extra.iter().for_each(|&m| result.push(key(m, 1)));
+            result.push(key(k, 1));
+            extra.iter().rev().for_each(|&m| result.push(key(m, 0)));
         }
         CGEventType::KeyUp => {
             let k = map_key(ev)?;
