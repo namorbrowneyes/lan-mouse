@@ -207,18 +207,23 @@ impl InputCaptureState {
     }
 }
 
-// fork: evdev left modifier keys for flags set on a key event but not physically held
+// fork: evdev left modifier keys for flags set on a key event but not physically held.
+// A posted Cmd is sent as Ctrl: it comes from a shortcut tool (Options+ Cmd+W) and the
+// other machine is Windows, where Ctrl is the shortcut key; Win+W/T are taken by the shell.
+// Cmd typed on the keyboard still arrives as Meta via FlagsChanged.
 fn synthetic_mods(flags: CGEventFlags, held: XMods) -> Vec<u32> {
-    [
+    let mut v: Vec<u32> = [
         (CGEventFlags::CGEventFlagControl, XMods::ControlMask, 29u32), // KEY_LEFTCTRL
+        (CGEventFlags::CGEventFlagCommand, XMods::Mod4Mask, 29),       // sent as KEY_LEFTCTRL
         (CGEventFlags::CGEventFlagShift, XMods::ShiftMask, 42),        // KEY_LEFTSHIFT
         (CGEventFlags::CGEventFlagAlternate, XMods::Mod1Mask, 56),     // KEY_LEFTALT
-        (CGEventFlags::CGEventFlagCommand, XMods::Mod4Mask, 125),      // KEY_LEFTMETA
     ]
     .into_iter()
     .filter(|&(f, m, _)| flags.contains(f) && !held.contains(m))
     .map(|(_, _, k)| k)
-    .collect()
+    .collect();
+    v.dedup(); // Cmd+Ctrl posted together: one Ctrl
+    v
 }
 
 #[cfg(test)]
@@ -227,9 +232,11 @@ mod synthetic_mods_tests {
     #[test]
     fn adds_only_unheld() {
         let f = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift;
-        assert_eq!(synthetic_mods(f, XMods::empty()), vec![42, 125]);
+        assert_eq!(synthetic_mods(f, XMods::empty()), vec![29, 42]);
         assert_eq!(synthetic_mods(f, XMods::Mod4Mask), vec![42]);
         assert!(synthetic_mods(CGEventFlags::empty(), XMods::empty()).is_empty());
+        let cc = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagControl;
+        assert_eq!(synthetic_mods(cc, XMods::empty()), vec![29]);
     }
 }
 
