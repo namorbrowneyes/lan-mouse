@@ -433,6 +433,8 @@ fn create_event_tap<'a>(
         state: Arc::clone(&client_state),
         tx: event_tx.clone(),
     });
+    let scroll_state = Arc::clone(&client_state);
+    let scroll_tx = event_tx.clone();
 
     let cg_events_of_interest: Vec<CGEventType> = vec![
         CGEventType::LeftMouseDown,
@@ -445,7 +447,6 @@ fn create_event_tap<'a>(
         CGEventType::LeftMouseDragged,
         CGEventType::RightMouseDragged,
         CGEventType::OtherMouseDragged,
-        CGEventType::ScrollWheel,
         CGEventType::KeyDown,
         CGEventType::KeyUp,
         CGEventType::FlagsChanged,
@@ -583,10 +584,55 @@ fn create_event_tap<'a>(
         .create_runloop_source(0)
         .expect("Failed creating loop source");
 
+    // fork: scroll is tapped at Session level, not HID, so scroll tools (Mos, SmoothScroll)
+    // still shape the wheel before it is forwarded; at HID level the wheel arrived raw
+    let scroll_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
+    let scroll_port_cb = Arc::clone(&scroll_port);
+    let scroll_tap = CGEventTap::new(
+        CGEventTapLocation::Session,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::Default,
+        vec![CGEventType::ScrollWheel],
+        move |_proxy: CGEventTapProxy, event_type: CGEventType, cg_ev: &CGEvent| {
+            if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+                if let Some(&port) = scroll_port_cb.get() {
+                    unsafe {
+                        CGEventTapEnable(port as *mut c_void, true);
+                    }
+                }
+                return CallbackResult::Keep;
+            }
+            if !matches!(event_type, CGEventType::ScrollWheel) {
+                return CallbackResult::Keep;
+            }
+            let mut state = scroll_state.blocking_lock();
+            let Some(pos) = state.current_pos else {
+                return CallbackResult::Keep;
+            };
+            let mut events = vec![];
+            get_events(&event_type, cg_ev, &mut events, &mut state.modifier_state)
+                .unwrap_or_else(|e| log::error!("Failed to get events: {e}"));
+            for e in events {
+                let _ = scroll_tx.blocking_send((pos, e));
+            }
+            cg_ev.set_type(CGEventType::Null);
+            CallbackResult::Drop
+        },
+    )
+    .map_err(|_| MacosCaptureCreationError::EventTapCreation)?;
+    let _ = scroll_port.set(scroll_tap.mach_port().as_concrete_TypeRef() as usize);
+    let scroll_source: CFRunLoopSource = scroll_tap
+        .mach_port()
+        .create_runloop_source(0)
+        .expect("Failed creating loop source");
+
     unsafe {
         CFRunLoop::get_current().add_source(&tap_source, kCFRunLoopCommonModes);
+        CFRunLoop::get_current().add_source(&scroll_source, kCFRunLoopCommonModes);
         create_media_tap(media_ctx);
     }
+    // lives as long as the process, like the media tap
+    std::mem::forget(scroll_tap);
 
     Ok(tap)
 }
