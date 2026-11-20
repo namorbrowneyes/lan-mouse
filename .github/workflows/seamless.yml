@@ -35,7 +35,7 @@ jobs:
     - name: Make icns
       run: scripts/makeicns.sh
     - name: Install cargo bundle
-      run: cargo install cargo-bundle
+      run: cargo install cargo-bundle --locked  # unlocked install broke 2026-11-19 (sigstore 0.14.0 does not compile)
     - name: Bundle
       run: |
         cargo bundle --release
