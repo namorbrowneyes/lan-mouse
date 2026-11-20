@@ -429,6 +429,11 @@ fn create_event_tap<'a>(
     let tap_mach_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
     let tap_mach_port_cb = Arc::clone(&tap_mach_port);
 
+    let media_ctx = Box::new(MediaTapCtx {
+        state: Arc::clone(&client_state),
+        tx: event_tx.clone(),
+    });
+
     let cg_events_of_interest: Vec<CGEventType> = vec![
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
@@ -555,8 +560,10 @@ fn create_event_tap<'a>(
         }
     };
 
+    // fork: HID, not Session, so this tap runs before session-level taps of other apps
+    // (dictation and media key tools) and they do not act on keys meant for the other machine
     let tap = CGEventTap::new(
-        CGEventTapLocation::Session,
+        CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         cg_events_of_interest,
@@ -578,9 +585,149 @@ fn create_event_tap<'a>(
 
     unsafe {
         CFRunLoop::get_current().add_source(&tap_source, kCFRunLoopCommonModes);
+        create_media_tap(media_ctx);
     }
 
     Ok(tap)
+}
+
+// fork: media keys (play/pause, next, previous, volume, mute) arrive as NSSystemDefined
+// events (type 14). core-graphics' CGEventType has no such variant, so they get a raw tap.
+const NX_SYSDEFINED: u32 = 14;
+const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+static MEDIA_TAP_PORT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct MediaTapCtx {
+    state: Arc<Mutex<InputCaptureState>>,
+    tx: Sender<(Position, CaptureEvent)>,
+}
+
+unsafe fn create_media_tap(ctx: Box<MediaTapCtx>) {
+    // 0, 0, 0 = kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault
+    let port = CGEventTapCreate(
+        0,
+        0,
+        0,
+        1u64 << NX_SYSDEFINED,
+        media_tap_callback,
+        Box::into_raw(ctx) as *mut c_void,
+    );
+    if port.is_null() {
+        log::warn!("media key tap not created, media keys stay on this machine");
+        return;
+    }
+    MEDIA_TAP_PORT.store(port as usize, std::sync::atomic::Ordering::Relaxed);
+    let source = CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+}
+
+extern "C" fn media_tap_callback(
+    _proxy: *mut c_void,
+    etype: u32,
+    event: *mut c_void,
+    info: *mut c_void,
+) -> *mut c_void {
+    if etype == TAP_DISABLED_BY_TIMEOUT {
+        let port = MEDIA_TAP_PORT.load(std::sync::atomic::Ordering::Relaxed);
+        unsafe { CGEventTapEnable(port as *mut c_void, true) };
+        return event;
+    }
+    if etype != NX_SYSDEFINED {
+        return event;
+    }
+    let ctx = unsafe { &*(info as *const MediaTapCtx) };
+    // only while the pointer is on the other machine
+    let current_pos = ctx.state.blocking_lock().current_pos;
+    let Some(pos) = current_pos else {
+        return event;
+    };
+    let Some((key, pressed, repeat)) = (unsafe { media_key(event) }) else {
+        return event;
+    };
+    // volume keys may repeat, transport keys must not (a held play key would toggle)
+    if !(repeat && key >= 163) {
+        let key_event = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state: if pressed { 1 } else { 0 },
+        }));
+        let _ = ctx.tx.blocking_send((pos, key_event));
+    }
+    std::ptr::null_mut() // drop: the key belongs to the other machine
+}
+
+/// (evdev key, pressed, repeat) for a media key event, None for any other system-defined event.
+unsafe fn media_key(cg_event: *mut c_void) -> Option<(u32, bool, bool)> {
+    let send = objc_msgSend as unsafe extern "C" fn();
+    let with_cg: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(send);
+    let get_short: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i16 =
+        std::mem::transmute(send);
+    let get_int: unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize =
+        std::mem::transmute(send);
+
+    let pool = objc_autoreleasePoolPush();
+    let ns_event = with_cg(
+        objc_getClass(c"NSEvent".as_ptr()),
+        sel_registerName(c"eventWithCGEvent:".as_ptr()),
+        cg_event,
+    );
+    // subtype 8 = NX_SUBTYPE_AUX_CONTROL_BUTTONS
+    let data1 = if !ns_event.is_null()
+        && get_short(ns_event, sel_registerName(c"subtype".as_ptr())) == 8
+    {
+        Some(get_int(ns_event, sel_registerName(c"data1".as_ptr())))
+    } else {
+        None
+    };
+    objc_autoreleasePoolPop(pool);
+
+    let data1 = data1?;
+    let flags = data1 & 0xFFFF;
+    let pressed = (flags & 0xFF00) >> 8 == 0x0A;
+    let repeat = flags & 1 == 1;
+    // NX_KEYTYPE_* -> evdev KEY_*
+    let key = match (data1 >> 16) & 0xFFFF {
+        0 => 115,       // sound up -> KEY_VOLUMEUP
+        1 => 114,       // sound down -> KEY_VOLUMEDOWN
+        7 => 113,       // mute -> KEY_MUTE
+        16 => 164,      // play -> KEY_PLAYPAUSE
+        17 | 19 => 163, // next, fast -> KEY_NEXTSONG
+        18 | 20 => 165, // previous, rewind -> KEY_PREVIOUSSONG
+        _ => return None,
+    };
+    Some((key, pressed, repeat))
+}
+
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
+
+#[link(name = "objc")]
+extern "C" {
+    fn objc_getClass(name: *const c_char) -> *mut c_void;
+    fn sel_registerName(name: *const c_char) -> *mut c_void;
+    fn objc_msgSend();
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> *mut c_void,
+        user_info: *mut c_void,
+    ) -> *mut c_void;
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: *mut c_void,
+        order: isize,
+    ) -> *mut c_void;
+    fn CFRunLoopAddSource(run_loop: *mut c_void, source: *mut c_void, mode: CFStringRef);
+    fn CFRunLoopGetCurrent() -> *mut c_void;
 }
 
 fn event_tap_thread(
