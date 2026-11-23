@@ -17,7 +17,7 @@ Not patched because upstream `main` already has it: `LAN_MOUSE_HIDDEN=1` starts 
 No local toolchain needed. Push to `seamless` (or run the workflow by hand) and `.github/workflows/seamless.yml` builds:
 
 - `lan-mouse-windows-daemon`: `lan-mouse.exe` without GTK (`--no-default-features`), enough for `lan-mouse.exe daemon`.
-- `lan-mouse-macos-arm64`: the app bundle, ad hoc signed.
+- `lan-mouse-macos-arm64-macos-15` and `-macos-14`: the app bundle, ad hoc signed, built on two runner pools because one is often out of capacity. Same app; take whichever job finished.
 
     gh run list --repo namorbrowneyes/lan-mouse --workflow seamless.yml --limit 1
     gh run download <run-id> --repo namorbrowneyes/lan-mouse -n lan-mouse-windows-daemon -D <dir>

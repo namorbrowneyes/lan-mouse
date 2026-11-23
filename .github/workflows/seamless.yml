@@ -23,7 +23,13 @@ jobs:
         path: target/release/lan-mouse.exe
 
   macos-arm64:
-    runs-on: macos-15
+    # two runner pools: macOS arm64 runners are often out of capacity and a queued job is
+    # cancelled after 15 min; either artifact will do
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
     - name: install dependencies
@@ -48,5 +54,5 @@ jobs:
         zip -r "lan-mouse-macos-arm64.zip" "Lan Mouse.app"
     - uses: actions/upload-artifact@v6
       with:
-        name: lan-mouse-macos-arm64
+        name: lan-mouse-macos-arm64-${{ matrix.os }}
         path: target/release/bundle/osx/lan-mouse-macos-arm64.zip
