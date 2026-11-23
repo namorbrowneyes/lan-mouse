@@ -226,9 +226,34 @@ fn synthetic_mods(flags: CGEventFlags, held: XMods) -> Vec<u32> {
     v
 }
 
+// fork: whole-chord replacements for posted keystrokes, as evdev keys pressed in order.
+// Options+ thumb button posts Ctrl+Option+Cmd+M (Hammerspoon opens Mission Control on the Mac).
+// As Ctrl+Alt+M it would start Wispr Flow on Windows (push-to-talk is Ctrl+Alt), so it goes
+// out as Win+Tab (Task View) instead.
+fn posted_chord(flags: CGEventFlags, held: XMods, key: u32) -> Option<[u32; 2]> {
+    let hyper = CGEventFlags::CGEventFlagControl
+        | CGEventFlags::CGEventFlagAlternate
+        | CGEventFlags::CGEventFlagCommand;
+    let hit = key == 50 // KEY_M
+        && held.is_empty()
+        && flags.contains(hyper)
+        && !flags.contains(CGEventFlags::CGEventFlagShift);
+    hit.then_some([125, 15]) // KEY_LEFTMETA, KEY_TAB
+}
+
 #[cfg(test)]
 mod synthetic_mods_tests {
     use super::*;
+    #[test]
+    fn thumb_chord_only() {
+        let hyper = CGEventFlags::CGEventFlagControl
+            | CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::CGEventFlagCommand;
+        assert_eq!(posted_chord(hyper, XMods::empty(), 50), Some([125, 15]));
+        assert_eq!(posted_chord(hyper, XMods::empty(), 17), None); // other key
+        assert_eq!(posted_chord(hyper, XMods::ControlMask, 50), None); // typed, not posted
+        assert_eq!(posted_chord(CGEventFlags::CGEventFlagCommand, XMods::empty(), 50), None);
+    }
     #[test]
     fn adds_only_unheld() {
         let f = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift;
@@ -267,20 +292,29 @@ fn get_events(
             let k = map_key(ev)?;
             // fork: apps like Logi Options+ post keystrokes with Cmd/Ctrl/Alt/Shift set only in
             // the event flags, with no FlagsChanged event, so the other side got a bare key.
-            // Press the missing modifiers around the key.
-            let extra = synthetic_mods(ev.get_flags(), *modifier_state);
+            // Press the missing modifiers around the key. (The flags exist at Session level
+            // only, which is why posted keys are captured by the Session tap.)
             let key = |key, state| CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { time: 0, key, state }));
-            extra.iter().for_each(|&m| result.push(key(m, 1)));
-            result.push(key(k, 1));
-            extra.iter().rev().for_each(|&m| result.push(key(m, 0)));
+            if let Some(chord) = posted_chord(ev.get_flags(), *modifier_state, k) {
+                chord.iter().for_each(|&c| result.push(key(c, 1)));
+                chord.iter().rev().for_each(|&c| result.push(key(c, 0)));
+            } else {
+                let extra = synthetic_mods(ev.get_flags(), *modifier_state);
+                extra.iter().for_each(|&m| result.push(key(m, 1)));
+                result.push(key(k, 1));
+                extra.iter().rev().for_each(|&m| result.push(key(m, 0)));
+            }
         }
         CGEventType::KeyUp => {
             let k = map_key(ev)?;
-            result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                time: 0,
-                key: k,
-                state: 0,
-            })));
+            // a replaced chord was pressed and released on key down already
+            if posted_chord(ev.get_flags(), *modifier_state, k).is_none() {
+                result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: k,
+                    state: 0,
+                })));
+            }
         }
         CGEventType::FlagsChanged => {
             let mut depressed = XMods::empty();
@@ -545,6 +579,20 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        // fork: a keystroke posted by an app (Logi Options+ mouse buttons) has no modifier
+        // flags yet at HID level. Let it pass; the Session-level tap below forwards it.
+        const SOURCE_UNIX_PROCESS_ID: CGEventField = 41;
+        if state.current_pos.is_some()
+            && matches!(
+                event_type,
+                CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+            )
+            && cg_ev.get_integer_value_field(SOURCE_UNIX_PROCESS_ID) != 0
+        {
+            log::debug!("posted {event_type:?} left to the session tap");
+            return CallbackResult::Keep;
+        }
+
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
@@ -621,14 +669,16 @@ fn create_event_tap<'a>(
         .expect("Failed creating loop source");
 
     // fork: scroll is tapped at Session level, not HID, so scroll tools (Mos, SmoothScroll)
-    // still shape the wheel before it is forwarded; at HID level the wheel arrived raw
+    // still shape the wheel before it is forwarded; at HID level the wheel arrived raw.
+    // It also takes the key events the HID tap let pass (posted by apps): only here do they
+    // carry their modifier flags. Typed keys never get this far while captured.
     let scroll_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
     let scroll_port_cb = Arc::clone(&scroll_port);
     let scroll_tap = CGEventTap::new(
         CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
-        vec![CGEventType::ScrollWheel],
+        vec![CGEventType::ScrollWheel, CGEventType::KeyDown, CGEventType::KeyUp],
         move |_proxy: CGEventTapProxy, event_type: CGEventType, cg_ev: &CGEvent| {
             if matches!(event_type, CGEventType::TapDisabledByTimeout) {
                 if let Some(&port) = scroll_port_cb.get() {
@@ -638,7 +688,10 @@ fn create_event_tap<'a>(
                 }
                 return CallbackResult::Keep;
             }
-            if !matches!(event_type, CGEventType::ScrollWheel) {
+            if !matches!(
+                event_type,
+                CGEventType::ScrollWheel | CGEventType::KeyDown | CGEventType::KeyUp
+            ) {
                 return CallbackResult::Keep;
             }
             let mut state = scroll_state.blocking_lock();
